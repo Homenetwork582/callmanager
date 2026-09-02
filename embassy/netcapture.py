@@ -110,7 +110,8 @@ def fetch(session=None):
     """
     dt_from, dt_to = capacity_window()
     params = capacity_params(dt_from, dt_to)
-    sess = session if session is not None else httpclient.make_session(_proxies())
+    sess = session if session is not None else httpclient.make_session(
+        _proxies())
     resp, err = httpclient.safe_get(sess, CAPACITY_URL, params=params,
                                     headers=_cap_headers())
     if resp is not None and resp.status_code == 422:
@@ -205,7 +206,8 @@ def capture_free(free, rows, anon_resp, anon_params, session, cycle):
 
     if session is not None:
         resp, params, err = fetch(session=session)
-        _rows, _free, mine = read_rows(resp) if resp is not None else ([], [], [])
+        _rows, _free, mine = read_rows(
+            resp) if resp is not None else ([], [], [])
         written.append(_save("free_session", {
             "kind": "capacity_free_logged_in",
             "ts": time.time(), "cycle": cycle,
@@ -246,7 +248,8 @@ def main():
         else float(cfg.get("poll_interval") or 0)
     dt_from, dt_to = capacity_window()
     print("=== Netzwerk-Capture (bucht nichts) ===")
-    print(f"Zeitraum:  {dt_from} .. {dt_to}  (kompletter Horizont, kein Monat)")
+    print(
+        f"Zeitraum:  {dt_from} .. {dt_to}  (kompletter Horizont, kein Monat)")
     print(f"Proxy:     {'an' if cfg.get('proxy_enabled') else 'aus'}")
     print(f"Intervall: {interval} s")
     print(f"Ablage:    {capture_mod.CAPTURE_DIR}")
@@ -288,7 +291,8 @@ def main():
                 ids = tuple(s["slot_id"] for s in free)
                 if ids != last_free_ids:
                     last_free_ids = ids
-                    files = capture_free(free, rows, resp, params, session, cycle)
+                    files = capture_free(
+                        free, rows, resp, params, session, cycle)
                     print(f"  >>> {len(free)} FREI - Capture geschrieben:")
                     for p in files:
                         print(f"      {os.path.basename(p)}")
