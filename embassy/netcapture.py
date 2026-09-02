@@ -20,6 +20,7 @@ import getpass
 import json
 import os
 import signal
+import threading
 import time
 from datetime import timedelta
 
@@ -41,19 +42,28 @@ CAPACITY_URL = f"{BASE_URL}/ajax/capacity/{RP_ID}"
 # Server bei ~112 Tagen abschneidet.
 HORIZON_DAYS = 121
 
-_stop = False
+# Diese Header landen nie in einer Capture-Datei.
+_SECRET_HEADERS = {"cookie", "set-cookie", "authorization",
+                   "proxy-authorization"}
+
+_STOP = threading.Event()
 
 
 def _sig(*_a):
-    global _stop
-    _stop = True
+    _STOP.set()
 
 
 signal.signal(signal.SIGINT, _sig)
 
 
+def _redact_headers(headers):
+    """Cookies und Zugangsdaten maskieren (wie booker/capture.py)."""
+    return {k: ("***" if k.lower() in _SECRET_HEADERS else v)
+            for k, v in (headers or {}).items()}
+
+
 def _save(tag, payload):
-    """Capture-Datei in captures/ schreiben (gleicher Ordner wie der Booker)."""
+    """Capture-Datei in captures/ ablegen (Ordner wie beim Booker)."""
     os.makedirs(capture_mod.CAPTURE_DIR, exist_ok=True)
     name = (f"{time.strftime('%Y%m%d_%H%M%S')}_netcap_{tag}_"
             f"{int(time.time() * 1000) % 100000}.json")
@@ -66,7 +76,7 @@ def _save(tag, payload):
 
 
 def _exchange(resp, request):
-    """Anfrage + vollstaendige Antwort als Dict (Cookies/Auth werden maskiert)."""
+    """Anfrage + vollstaendige Antwort als Dict (Cookies/Auth maskiert)."""
     out = {"request": request, "response": None}
     if resp is not None:
         out["response"] = {
@@ -74,10 +84,16 @@ def _exchange(resp, request):
             "url": resp.url,
             "elapsed_ms": round(resp.elapsed.total_seconds() * 1000, 1)
             if resp.elapsed is not None else None,
-            "headers": capture_mod._redact_headers(dict(resp.headers or {})),
+            "headers": _redact_headers(dict(resp.headers or {})),
             "body": resp.text,
         }
     return out
+
+
+def _capacity_request(params):
+    """Beschreibung des Kapazitaets-Calls fuer die Capture-Datei."""
+    return {"method": "GET", "url": CAPACITY_URL, "params": dict(params),
+            "headers": _cap_headers()}
 
 
 def capacity_window():
@@ -124,10 +140,10 @@ def fetch(session=None):
 
 
 def read_rows(resp):
-    """(alle Zeilen, freie Zeilen, mine) aus der Antwort - ohne jeden Filter."""
+    """(alle Zeilen, freie Zeilen, mine) der Antwort - ohne jeden Filter."""
     try:
         data = resp.json()
-    except Exception:
+    except ValueError:      # kein JSON (WAF-Seite, Captcha, leere Antwort)
         return [], [], []
     rows = data.get("app", []) or []
     free = []
@@ -148,8 +164,18 @@ def read_rows(resp):
     return rows, free, data.get("mine", []) or []
 
 
+def scan_once():
+    """Ein anonymer Kapazitaets-Call inklusive Auswertung."""
+    started = time.time()
+    resp, params, err = fetch()
+    ok = resp is not None and resp.status_code == 200
+    rows, free, _mine = read_rows(resp) if ok else ([], [], [])
+    return {"resp": resp, "params": params, "err": err, "rows": rows,
+            "free": free, "ok": ok, "ms": (time.time() - started) * 1000}
+
+
 def booking_page(session, slot):
-    """Die Buchungsseite des freien Slots holen - nur GET, es wird nicht gebucht.
+    """Buchungsseite des freien Slots holen - nur GET, es bucht nichts.
 
     Gleiche URL, auf die booker/booking.py den Buchungs-POST schickt. Es werden
     die Header der Login-Session benutzt (kein XMLHttpRequest wie beim
@@ -173,7 +199,7 @@ def login():
     email = input("E-Mail: ").strip()
     try:
         password = getpass.getpass("Passwort: ").strip()
-    except Exception:
+    except (EOFError, OSError):   # Konsole ohne verstecktes Eingabefeld
         password = input("Passwort: ").strip()
     if not email or not password:
         print("E-Mail und Passwort sind erforderlich.")
@@ -188,51 +214,117 @@ def login():
     return None
 
 
-def capture_free(free, rows, anon_resp, anon_params, session, cycle):
-    """Alles festhalten, was zu diesem freien Zeitpunkt sichtbar ist."""
-    written = []
-    proxy_used = bool(_proxies())
-    written.append(_save("free_anon", {
+def _capture_baseline(scan, cycle):
+    """Erste erfolgreiche Antwort als Vergleichsbasis ("voll") mitschreiben."""
+    path = _save("baseline", {
+        "kind": "capacity_baseline", "ts": time.time(),
+        "cycle": cycle, "horizon_days": HORIZON_DAYS,
+        "rows_total": len(scan["rows"]), "free_count": len(scan["free"]),
+        **_exchange(scan["resp"], _capacity_request(scan["params"])),
+    })
+    print(f"Baseline gespeichert: {os.path.basename(path)} "
+          f"({len(scan['rows'])} Termine in der Antwort)")
+
+
+def _capture_anon(scan, cycle):
+    """Der anonyme Call, der die freien Termine gesehen hat."""
+    return _save("free_anon", {
         "kind": "capacity_free_anonymous",
         "ts": time.time(), "cycle": cycle,
         "horizon_days": HORIZON_DAYS,
-        "proxy": "iproyal-rotating" if proxy_used else "direct",
-        "rows_total": len(rows), "free_count": len(free),
-        "free_slots": free,
-        **_exchange(anon_resp, {"method": "GET", "url": CAPACITY_URL,
-                                "params": dict(anon_params),
-                                "headers": _cap_headers()}),
-    }))
+        "proxy": "iproyal-rotating" if _proxies() else "direct",
+        "rows_total": len(scan["rows"]), "free_count": len(scan["free"]),
+        "free_slots": scan["free"],
+        **_exchange(scan["resp"], _capacity_request(scan["params"])),
+    })
 
+
+def _capture_session(session, cycle):
+    """Derselbe Call mit der Login-Session - liefert zusaetzlich `mine`."""
+    resp, params, err = fetch(session=session)
+    rows, free, mine = read_rows(resp) if resp is not None else ([], [], [])
+    return _save("free_session", {
+        "kind": "capacity_free_logged_in",
+        "ts": time.time(), "cycle": cycle,
+        "horizon_days": HORIZON_DAYS,
+        "error": None if resp is not None else str(err),
+        "rows_total": len(rows), "free_count": len(free), "mine": mine,
+        **_exchange(resp, _capacity_request(params)),
+    })
+
+
+def _capture_page(session, slot, cycle):
+    """Die Buchungsseite zum fruehesten freien Slot (nur GET)."""
+    page, url, err = booking_page(session, slot)
+    return _save("free_page", {
+        "kind": "booking_page_when_free",
+        "ts": time.time(), "cycle": cycle,
+        "slot": {k: v for k, v in slot.items() if k != "raw_row"},
+        "error": None if page is not None else str(err),
+        **_exchange(page, {
+            "method": "GET", "url": url, "params": {},
+            "headers": _redact_headers(dict(session.headers))}),
+    })
+
+
+def capture_free(scan, session, cycle):
+    """Alles festhalten, was zu diesem freien Zeitpunkt sichtbar ist."""
+    written = [_capture_anon(scan, cycle)]
     if session is not None:
-        resp, params, err = fetch(session=session)
-        _rows, _free, mine = read_rows(
-            resp) if resp is not None else ([], [], [])
-        written.append(_save("free_session", {
-            "kind": "capacity_free_logged_in",
-            "ts": time.time(), "cycle": cycle,
-            "horizon_days": HORIZON_DAYS,
-            "error": None if resp is not None else str(err),
-            "rows_total": len(_rows), "free_count": len(_free), "mine": mine,
-            **_exchange(resp, {"method": "GET", "url": CAPACITY_URL,
-                               "params": dict(params),
-                               "headers": _cap_headers()}),
-        }))
-
-        page, url, perr = booking_page(session, free[0])
-        written.append(_save("free_page", {
-            "kind": "booking_page_when_free",
-            "ts": time.time(), "cycle": cycle,
-            "slot": {k: v for k, v in free[0].items() if k != "raw_row"},
-            "error": None if page is not None else str(perr),
-            **_exchange(page, {
-                "method": "GET", "url": url, "params": {},
-                "headers": capture_mod._redact_headers(dict(session.headers))}),
-        }))
+        written.append(_capture_session(session, cycle))
+        written.append(_capture_page(session, scan["free"][0], cycle))
     return written
 
 
-def main():
+def _report_problem(scan, cycle):
+    stamp = time.strftime("%H:%M:%S")
+    if scan["resp"] is None:
+        print(f"[{stamp}] #{cycle} Fehler: {scan['err']}")
+    else:
+        print(f"[{stamp}] #{cycle} HTTP {scan['resp'].status_code} "
+              f"({scan['ms']:.0f} ms)")
+
+
+def _report_free(files, free):
+    print(f"  >>> {len(free)} FREI - Capture geschrieben:")
+    for path in files:
+        print(f"      {os.path.basename(path)}")
+    for slot in free:
+        print(f"      {slot['start_local']} Zypern (ID {slot['slot_id']}, "
+              f"{slot['booked']}/{slot['capacity']})")
+
+
+def watch(session, interval, stop_on_first=False):
+    """Dauerschleife: abfragen, melden und bei freien Terminen mitschneiden."""
+    cycle = 0
+    baseline_done = False
+    last_free_ids = None
+    while not _STOP.is_set():
+        cycle += 1
+        scan = scan_once()
+        if not scan["ok"]:
+            _report_problem(scan, cycle)
+            _STOP.wait(interval)
+            continue
+        if not baseline_done:
+            _capture_baseline(scan, cycle)
+            baseline_done = True
+        free = scan["free"]
+        print(f"[{time.strftime('%H:%M:%S')}] #{cycle} OK {scan['ms']:.0f} ms "
+              f"| Termine: {len(scan['rows'])} | frei: {len(free)}")
+        ids = tuple(s["slot_id"] for s in free)
+        if free and ids != last_free_ids:
+            last_free_ids = ids
+            _report_free(capture_free(scan, session, cycle), free)
+            if stop_on_first:
+                break
+        elif not free:
+            last_free_ids = None
+        _STOP.wait(interval)
+    print("\nBeendet.")
+
+
+def _parse_args():
     ap = argparse.ArgumentParser(description="Netzwerk-Capture freier Termine")
     ap.add_argument("--no-login", action="store_true",
                     help="nur anonym scannen, kein Login")
@@ -241,72 +333,29 @@ def main():
     ap.add_argument("--interval", type=float, default=None,
                     help="Sekunden zwischen den Abfragen "
                          "(Standard: poll_interval aus booker_config.json)")
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    cfg = load_config()
-    interval = args.interval if args.interval is not None \
-        else float(cfg.get("poll_interval") or 0)
+
+def _print_header(cfg, interval):
     dt_from, dt_to = capacity_window()
     print("=== Netzwerk-Capture (bucht nichts) ===")
-    print(
-        f"Zeitraum:  {dt_from} .. {dt_to}  (kompletter Horizont, kein Monat)")
+    print(f"Zeitraum:  {dt_from} .. {dt_to} "
+          f"(kompletter Horizont, kein Monat)")
     print(f"Proxy:     {'an' if cfg.get('proxy_enabled') else 'aus'}")
     print(f"Intervall: {interval} s")
     print(f"Ablage:    {capture_mod.CAPTURE_DIR}")
 
+
+def main():
+    """Argumente lesen, anmelden und die Dauerschleife starten."""
+    args = _parse_args()
+    cfg = load_config()
+    interval = args.interval if args.interval is not None \
+        else float(cfg.get("poll_interval") or 0)
+    _print_header(cfg, interval)
     session = None if args.no_login else login()
     print("-" * 60)
-
-    cycle = 0
-    baseline_done = False
-    last_free_ids = None
-    while not _stop:
-        cycle += 1
-        t0 = time.time()
-        resp, params, err = fetch()
-        ms = (time.time() - t0) * 1000
-        if resp is None:
-            print(f"[{time.strftime('%H:%M:%S')}] #{cycle} Fehler: {err}")
-        elif resp.status_code != 200:
-            print(f"[{time.strftime('%H:%M:%S')}] #{cycle} "
-                  f"HTTP {resp.status_code} ({ms:.0f} ms)")
-        else:
-            rows, free, _mine = read_rows(resp)
-            if not baseline_done:
-                # Erste erfolgreiche Antwort als Vergleichsbasis mitschreiben.
-                path = _save("baseline", {
-                    "kind": "capacity_baseline", "ts": time.time(),
-                    "cycle": cycle, "horizon_days": HORIZON_DAYS,
-                    "rows_total": len(rows), "free_count": len(free),
-                    **_exchange(resp, {"method": "GET", "url": CAPACITY_URL,
-                                       "params": dict(params),
-                                       "headers": _cap_headers()}),
-                })
-                baseline_done = True
-                print(f"Baseline gespeichert: {os.path.basename(path)} "
-                      f"({len(rows)} Termine in der Antwort)")
-            print(f"[{time.strftime('%H:%M:%S')}] #{cycle} OK {ms:.0f} ms | "
-                  f"Termine: {len(rows)} | frei: {len(free)}")
-            if free:
-                ids = tuple(s["slot_id"] for s in free)
-                if ids != last_free_ids:
-                    last_free_ids = ids
-                    files = capture_free(
-                        free, rows, resp, params, session, cycle)
-                    print(f"  >>> {len(free)} FREI - Capture geschrieben:")
-                    for p in files:
-                        print(f"      {os.path.basename(p)}")
-                    for s in free:
-                        print(f"      {s['start_local']} Zypern "
-                              f"(ID {s['slot_id']}, {s['booked']}/{s['capacity']})")
-                    if args.stop_on_first:
-                        break
-            else:
-                last_free_ids = None
-        s = time.time()
-        while time.time() - s < interval and not _stop:
-            time.sleep(0.2)
-    print("\nBeendet.")
+    watch(session, interval, stop_on_first=args.stop_on_first)
 
 
 if __name__ == "__main__":
